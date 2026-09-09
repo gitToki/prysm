@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/feed"
+	statefeed "github.com/OffchainLabs/prysm/v7/beacon-chain/core/feed/state"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/peerdas"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
@@ -15,6 +17,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/runtime/logging"
+	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -37,6 +40,7 @@ type pendingGloasEntry struct {
 
 func (s *Service) validateDataColumnGloas(
 	ctx context.Context,
+	pid peer.ID,
 	msg *pubsub.Message,
 	roDataColumn blocks.RODataColumn,
 	dataColumnSidecarSubTopic string,
@@ -48,17 +52,27 @@ func (s *Service) validateDataColumnGloas(
 	// If not yet seen, a client MUST queue the sidecar for deferred validation and possible processing once
 	// the block is received or retrieved.
 	if s.cfg.chain == nil || !s.cfg.chain.HasBlock(ctx, roDataColumn.BlockRoot()) {
+		// The slot is attacker controlled, a far-future slot would make the queued entry unprunable.
+		if err := s.gloasColumnNotFromFutureSlot(roDataColumn.Slot()); err != nil {
+			return blocks.VerifiedRODataColumn{}, ignoreValidation(err)
+		}
 		actualSubnet := peerdas.ComputeSubnetForDataColumnSidecar(roDataColumn.Index())
 		expectedSubTopic := fmt.Sprintf(dataColumnSidecarSubTopic, actualSubnet)
 		if msg.Topic == nil || !strings.Contains(*msg.Topic+"/", expectedSubTopic) {
 			return blocks.VerifiedRODataColumn{}, errors.New("gloas data column on wrong subnet")
 		}
-		s.queuePendingGloasColumn(roDataColumn, peer.ID(msg.GetFrom()))
+		if err := s.queuePendingGloasColumn(roDataColumn, pid); err != nil {
+			return blocks.VerifiedRODataColumn{}, err
+		}
 		return blocks.VerifiedRODataColumn{}, ignoreValidation(errors.New("gloas data column block not yet seen"))
 	}
 
 	block, err := s.cfg.beaconDB.Block(ctx, roDataColumn.BlockRoot())
 	if err != nil {
+		return blocks.VerifiedRODataColumn{}, ignoreValidation(err)
+	}
+	// A seen block may live in the init-sync cache but not yet in the DB, so Block can return (nil, nil).
+	if err := blocks.BeaconBlockIsNil(block); err != nil {
 		return blocks.VerifiedRODataColumn{}, ignoreValidation(err)
 	}
 	verifier := verification.NewGloasDataColumnVerifier(roDataColumn, block.Block(), verification.GossipDataColumnSidecarRequirementsGloas)
@@ -123,14 +137,33 @@ func (s *Service) setSeenDataColumnRootIndex(root [fieldparams.RootLength]byte, 
 	s.seenDataColumnCache.Add(slot, key, true)
 }
 
-func (s *Service) queuePendingGloasColumn(roCol blocks.RODataColumn, pid peer.ID) {
+// hasSeenDataColumn reports whether the sidecar identity has been seen. Gloas sidecars are keyed
+// by (block root, index); pre-Gloas sidecars by (slot, proposer index, index).
+func (s *Service) hasSeenDataColumn(isGloas bool, root [fieldparams.RootLength]byte, slot primitives.Slot, proposerIndex primitives.ValidatorIndex, index uint64) bool {
+	if isGloas {
+		return s.hasSeenDataColumnRootIndex(root, index)
+	}
+	return s.hasSeenDataColumnIndex(slot, proposerIndex, index)
+}
+
+// queuePendingGloasColumn returns a non-nil error for malformed sidecars (the caller propagates it as ValidationReject).
+func (s *Service) queuePendingGloasColumn(roCol blocks.RODataColumn, pid peer.ID) error {
 	dc := roCol.DataColumnSidecarGloas()
 	if dc == nil {
-		return
+		return errors.New("nil gloas data column sidecar")
+	}
+	cells := len(dc.Column)
+	if cells == 0 || len(dc.KzgProofs) != cells {
+		return errors.Errorf("gloas data column length mismatch: cells=%d proofs=%d", cells, len(dc.KzgProofs))
+	}
+	cfg := params.BeaconConfig()
+	currentEpoch := slots.ToEpoch(s.cfg.clock.CurrentSlot())
+	if cells > max(cfg.MaxBlobsPerBlockAtEpoch(currentEpoch), cfg.MaxBlobsPerBlockAtEpoch(currentEpoch+1)) {
+		return errors.Errorf("gloas data column cell count %d exceeds network blob limit", cells)
 	}
 	idx := roCol.Index()
 	if idx >= fieldparams.NumberOfColumns {
-		return
+		return errors.Errorf("gloas data column index %d out of range", idx)
 	}
 
 	root := roCol.BlockRoot()
@@ -142,19 +175,35 @@ func (s *Service) queuePendingGloasColumn(roCol blocks.RODataColumn, pid peer.ID
 	entry := s.pendingGloasColumns[root]
 	if entry == nil {
 		if len(s.pendingGloasColumns) >= maxPendingGloasRoots {
-			return
+			return nil
 		}
 		entry = &pendingGloasEntry{slot: slot}
 		s.pendingGloasColumns[root] = entry
 	}
 
 	if entry.columns[idx] != nil {
-		return
+		return nil
 	}
 	entry.columns[idx] = &pendingColumnEntry{sidecar: dc, peer: pid}
+	return nil
 }
 
-func (s *Service) processPendingGloasColumns(root [fieldparams.RootLength]byte, blk interfaces.ReadOnlySignedBeaconBlock) {
+func (s *Service) gloasColumnNotFromFutureSlot(slot primitives.Slot) error {
+	if s.cfg.clock.CurrentSlot() == slot {
+		return nil
+	}
+	earliestStart, err := s.cfg.clock.SlotStart(slot)
+	if err != nil {
+		return errors.Wrap(err, "slot start time")
+	}
+	earliestStart = earliestStart.Add(-params.BeaconConfig().MaximumGossipClockDisparityDuration())
+	if s.cfg.clock.Now().Before(earliestStart) {
+		return errors.Errorf("gloas data column slot %d is from a future slot", slot)
+	}
+	return nil
+}
+
+func (s *Service) processPendingGloasColumns(ctx context.Context, root [fieldparams.RootLength]byte, blk interfaces.ReadOnlySignedBeaconBlock) {
 	if blk == nil || blk.IsNil() {
 		return
 	}
@@ -184,7 +233,6 @@ func (s *Service) processPendingGloasColumns(root [fieldparams.RootLength]byte, 
 
 	verified := make([]blocks.VerifiedRODataColumn, 0, count)
 	var skipped int
-	badPeers := make(map[peer.ID]bool)
 	for _, pe := range entry.columns {
 		if pe == nil {
 			continue
@@ -205,17 +253,17 @@ func (s *Service) processPendingGloasColumns(root [fieldparams.RootLength]byte, 
 
 		if err := verifier.VerifyDataColumnSidecarSlotMatchesBlockGloas(); err != nil {
 			skipped++
-			badPeers[pe.peer] = true
+			s.downscorePeer(pe.peer, "pendingGloasColumnSlotMismatch", logrus.Fields{"error": err})
 			continue
 		}
 		if err := verifier.VerifyDataColumnSidecarGloas(); err != nil {
 			skipped++
-			badPeers[pe.peer] = true
+			s.downscorePeer(pe.peer, "pendingGloasColumnInvalidSidecar", logrus.Fields{"error": err})
 			continue
 		}
 		if err := verifier.VerifyDataColumnSidecarKzgProofsGloas(); err != nil {
 			skipped++
-			badPeers[pe.peer] = true
+			s.downscorePeer(pe.peer, "pendingGloasColumnInvalidKzgProof", logrus.Fields{"error": err})
 			continue
 		}
 
@@ -231,14 +279,14 @@ func (s *Service) processPendingGloasColumns(root [fieldparams.RootLength]byte, 
 		verified = append(verified, v)
 	}
 
-	for pid := range badPeers {
-		s.cfg.p2p.Peers().Scorers().BadResponsesScorer().Increment(pid)
-	}
-
 	if len(verified) > 0 {
 		if err := s.cfg.dataColumnStorage.Save(verified); err != nil {
 			log.WithError(err).WithField("root", fmt.Sprintf("%#x", root)).Warn("Failed to save pending Gloas columns")
 			return
+		}
+
+		if err := s.cfg.p2p.BroadcastDataColumnSidecars(ctx, verified, nil); err != nil {
+			log.WithError(err).WithField("root", fmt.Sprintf("%#x", root)).Warn("Failed to broadcast pending Gloas columns")
 		}
 
 		log.WithFields(logrus.Fields{
@@ -257,22 +305,67 @@ func (s *Service) hasPendingGloasColumns(root [fieldparams.RootLength]byte) bool
 	return ok
 }
 
+// processPendingGloasColumnsRoutine drains pending Gloas columns once their block
+// is processed. Blocks we propose ourselves are imported via the RPC path and never
+// re-enter the gossip/by-root ingest paths that drain the queue, so the columns peers
+// gossip back to us (queued while the block was not yet seen) would otherwise be lost.
+func (s *Service) processPendingGloasColumnsRoutine() {
+	ch := make(chan *feed.Event, 1)
+	sub := s.cfg.stateNotifier.StateFeed().Subscribe(ch)
+	defer sub.Unsubscribe()
+
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Type != statefeed.BlockProcessed {
+				continue
+			}
+			data, ok := ev.Data.(*statefeed.BlockProcessedData)
+			if !ok || data == nil || data.SignedBlock == nil || data.SignedBlock.IsNil() {
+				continue
+			}
+			if data.SignedBlock.Version() < version.Gloas {
+				continue
+			}
+			// Initial sync imports via the batch path (which also emits this event) and has
+			// no gossip-queued columns; draining there would needlessly re-broadcast.
+			if s.cfg.initialSync != nil && s.cfg.initialSync.Syncing() {
+				continue
+			}
+			go s.processPendingGloasColumns(s.ctx, data.BlockRoot, data.SignedBlock)
+		case <-sub.Err():
+			return
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
 // prunePendingGloasColumns removes stale entries every slot.
 func (s *Service) prunePendingGloasColumns() {
-	slotTicker := slots.NewSlotTicker(s.cfg.clock.GenesisTime(), params.BeaconConfig().SecondsPerSlot)
+	clock, err := s.clockWaiter.WaitForClock(s.ctx)
+	if err != nil {
+		log.WithError(err).Error("Failed to receive clock for pending Gloas columns pruning routine")
+		return
+	}
+	slotTicker := slots.NewSlotTicker(clock.GenesisTime(), params.BeaconConfig().SlotDuration())
 	defer slotTicker.Done()
 	for {
 		select {
 		case currentSlot := <-slotTicker.C():
-			s.pendingGloasColumnsLock.Lock()
-			for r, e := range s.pendingGloasColumns {
-				if e.slot+1 < currentSlot {
-					delete(s.pendingGloasColumns, r)
-				}
-			}
-			s.pendingGloasColumnsLock.Unlock()
+			s.pruneStaleGloasColumns(currentSlot)
 		case <-s.ctx.Done():
 			return
+		}
+	}
+}
+
+func (s *Service) pruneStaleGloasColumns(currentSlot primitives.Slot) {
+	s.pendingGloasColumnsLock.Lock()
+	defer s.pendingGloasColumnsLock.Unlock()
+	for r, e := range s.pendingGloasColumns {
+		if e.slot+1 < currentSlot {
+			delete(s.pendingGloasColumns, r)
 		}
 	}
 }

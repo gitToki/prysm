@@ -45,8 +45,8 @@ func GenerateProtoGloasBeaconBlock() *ethpb.BeaconBlockGloas {
 					},
 				},
 			},
-			AttesterSlashings: []*ethpb.AttesterSlashingElectra{},
-			Attestations:      []*ethpb.AttestationElectra{},
+			AttesterSlashings: []*ethpb.AttesterSlashingGloas{},
+			Attestations:      []*ethpb.AttestationGloas{},
 			Deposits:          []*ethpb.Deposit{},
 			VoluntaryExits:    []*ethpb.SignedVoluntaryExit{},
 			SyncAggregate: &ethpb.SyncAggregate{
@@ -159,8 +159,9 @@ func GenerateProtoExecutionPayloadEnvelope() *ethpb.ExecutionPayloadEnvelope {
 			ExtraData:     make([]byte, 0),
 			SlotNumber:    1,
 		},
-		ExecutionRequests: &enginev1.ExecutionRequests{},
-		BuilderIndex:      121,
-		BeaconBlockRoot:   FillByteSlice(32, 210),
+		ExecutionRequests:     &enginev1.ExecutionRequestsGloas{},
+		BuilderIndex:          121,
+		BeaconBlockRoot:       FillByteSlice(32, 210),
+		ParentBeaconBlockRoot: FillByteSlice(32, 211),
 	}
 }

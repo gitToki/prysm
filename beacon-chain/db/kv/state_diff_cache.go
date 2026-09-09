@@ -4,25 +4,28 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"strconv"
 	"sync"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
 	"github.com/OffchainLabs/prysm/v7/cmd/beacon-chain/flags"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/golang/snappy"
 	pkgerrors "github.com/pkg/errors"
 	"go.etcd.io/bbolt"
 )
 
 type stateDiffCache struct {
 	sync.RWMutex
-	anchors        []state.ReadOnlyBeaconState
-	levelsWithData []bool
-	offset         uint64
+	anchors          [][]byte
+	levelsWithData   []bool
+	offset           uint64
+	anchorGeneration uint64
 }
 
 func populateStateDiffCacheFromDB(s *Store, offset uint64) (*stateDiffCache, error) {
 	cache := &stateDiffCache{
-		anchors:        make([]state.ReadOnlyBeaconState, len(flags.Get().StateDiffExponents)-1),
+		anchors:        make([][]byte, len(flags.Get().StateDiffExponents)-1),
 		levelsWithData: make([]bool, len(flags.Get().StateDiffExponents)),
 		offset:         offset,
 	}
@@ -74,7 +77,10 @@ func populateStateDiffCacheFromDB(s *Store, offset uint64) (*stateDiffCache, err
 	// Only cache anchor if there are higher levels that need it.
 	// With a single exponent, len(anchors)==0 and no caching is needed.
 	if len(cache.anchors) > 0 {
-		cache.anchors[0] = anchor0
+		err := cache.setAnchor(0, anchor0)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cache.levelsWithData[0] = true
 
@@ -171,7 +177,7 @@ func newStateDiffCache(s *Store) (*stateDiffCache, error) {
 	}
 
 	return &stateDiffCache{
-		anchors:        make([]state.ReadOnlyBeaconState, len(flags.Get().StateDiffExponents)-1), // -1 because last level doesn't need to be cached
+		anchors:        make([][]byte, len(flags.Get().StateDiffExponents)-1), // -1 because last level doesn't need to be cached
 		levelsWithData: make([]bool, len(flags.Get().StateDiffExponents)),
 		offset:         offset,
 	}, nil
@@ -179,18 +185,75 @@ func newStateDiffCache(s *Store) (*stateDiffCache, error) {
 
 func (c *stateDiffCache) getAnchor(level int) state.ReadOnlyBeaconState {
 	c.RLock()
-	defer c.RUnlock()
-	return c.anchors[level]
+	if level < 0 || level >= len(c.anchors) {
+		c.RUnlock()
+		return nil
+	}
+	compressed := c.anchors[level]
+	c.RUnlock()
+
+	if len(compressed) == 0 {
+		return nil
+	}
+
+	uncompressed, err := snappy.Decode(nil, compressed)
+	if err != nil {
+		return nil
+	}
+
+	st, err := decodeStateSnapshot(uncompressed)
+	if err != nil {
+		return nil
+	}
+
+	return st
 }
 
 func (c *stateDiffCache) setAnchor(level int, anchor state.ReadOnlyBeaconState) error {
-	c.Lock()
-	defer c.Unlock()
-	if level >= len(c.anchors) || level < 0 {
+	c.RLock()
+	if level < 0 || level >= len(c.anchors) {
+		c.RUnlock()
 		return errors.New("state diff cache: anchor level out of range")
 	}
-	c.anchors[level] = anchor
+	generation := c.anchorGeneration
+	c.RUnlock()
+
+	if anchor == nil {
+		return errors.New("state diff cache: anchor cannot be nil")
+	}
+
+	anchorSSZ, err := anchor.MarshalSSZ()
+	if err != nil {
+		return err
+	}
+	versionedAnchorBytes, err := addKey(anchor.Version(), anchorSSZ)
+	if err != nil {
+		return err
+	}
+	encoded := snappy.Encode(nil, versionedAnchorBytes)
+	compressed := make([]byte, len(encoded))
+	copy(compressed, encoded)
+
+	c.Lock()
+	defer c.Unlock()
+
+	if generation != c.anchorGeneration {
+		return nil
+	}
+	c.anchors[level] = compressed
+	stateDiffAnchorCacheBytes.WithLabelValues(strconv.Itoa(level)).Set(float64(len(compressed)))
 	return nil
+}
+
+// reanchor points the cache at a new offset and drops the cached anchors
+func (c *stateDiffCache) reanchor(offset uint64, levelsWithData []bool) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.offset = offset
+	c.levelsWithData = levelsWithData
+
+	c.clearAnchorsLocked()
 }
 
 func (c *stateDiffCache) levelHasData(level int) bool {
@@ -227,5 +290,14 @@ func (c *stateDiffCache) setOffset(offset uint64) {
 func (c *stateDiffCache) clearAnchors() {
 	c.Lock()
 	defer c.Unlock()
-	c.anchors = make([]state.ReadOnlyBeaconState, len(flags.Get().StateDiffExponents)-1) // -1 because last level doesn't need to be cached
+	c.clearAnchorsLocked()
+}
+
+// clearAnchorsLocked is clearAnchors, for the callers that already hold the lock.
+func (c *stateDiffCache) clearAnchorsLocked() {
+	c.anchorGeneration++
+	c.anchors = make([][]byte, len(flags.Get().StateDiffExponents)-1) // -1 because last level doesn't need to be cached
+	for level := range len(c.anchors) {
+		stateDiffAnchorCacheBytes.WithLabelValues(strconv.Itoa(level)).Set(0)
+	}
 }

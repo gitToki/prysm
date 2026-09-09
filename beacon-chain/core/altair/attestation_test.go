@@ -313,9 +313,9 @@ func TestProcessAttestationNoVerify_SourceTargetHead(t *testing.T) {
 	copy(ckp.Root, make([]byte, fieldparams.RootLength))
 	require.NoError(t, beaconState.SetCurrentJustifiedCheckpoint(ckp))
 
-	b, err := helpers.TotalActiveBalance(beaconState)
+	b, err := helpers.TotalActiveBalance(t.Context(), beaconState)
 	require.NoError(t, err)
-	beaconState, err = altair.ProcessAttestationNoVerifySignature(t.Context(), beaconState, att, b)
+	beaconState, err = altair.ProcessAttestationNoVerifySignature(t.Context(), beaconState, att, b, 0)
 	require.NoError(t, err)
 
 	p, err := beaconState.CurrentEpochParticipation()
@@ -469,6 +469,9 @@ func TestFuzzProcessAttestationsNoVerify_10000(t *testing.T) {
 		if b.Block == nil {
 			b.Block = &ethpb.BeaconBlockAltair{}
 		}
+		if st.LatestBlockHeader == nil {
+			st.LatestBlockHeader = &ethpb.BeaconBlockHeader{}
+		}
 		s, err := state_native.InitializeFromProtoUnsafeAltair(st)
 		require.NoError(t, err)
 		if b.Block == nil || b.Block.Body == nil {
@@ -556,7 +559,7 @@ func TestSetParticipationAndRewardProposer(t *testing.T) {
 				require.NoError(t, beaconState.SetPreviousParticipationBits(test.epochParticipation))
 			}
 
-			b, err := helpers.TotalActiveBalance(beaconState)
+			b, err := helpers.TotalActiveBalance(t.Context(), beaconState)
 			require.NoError(t, err)
 			st, err := altair.SetParticipationAndRewardProposer(t.Context(), beaconState, test.epoch, test.indices, test.participatedFlags, b, &ethpb.Attestation{})
 			require.NoError(t, err)
@@ -641,7 +644,7 @@ func TestEpochParticipation(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		b, err := helpers.TotalActiveBalance(beaconState)
+		b, err := helpers.TotalActiveBalance(t.Context(), beaconState)
 		require.NoError(t, err)
 		n, p, err := altair.EpochParticipation(beaconState, test.indices, test.epochParticipation, test.participatedFlags, b)
 		require.NoError(t, err)
@@ -689,6 +692,7 @@ func TestAttestationParticipationFlagIndices(t *testing.T) {
 		inputState           state.BeaconState
 		inputData            *ethpb.AttestationData
 		inputDelay           primitives.Slot
+		inputParentSlot      primitives.Slot
 		participationIndices map[uint8]bool
 	}{
 		{
@@ -820,7 +824,36 @@ func TestAttestationParticipationFlagIndices(t *testing.T) {
 					Root:  bytes.Repeat([]byte{0xAA}, 32),
 				},
 			},
-			inputDelay: 1,
+			inputDelay:      1,
+			inputParentSlot: 3,
+			participationIndices: map[uint8]bool{
+				sourceFlagIndex: true,
+				targetFlagIndex: true,
+				headFlagIndex:   true,
+			},
+		},
+		{
+			name: "gloas skipped data slot uses parent slot availability",
+			inputState: func() state.BeaconState {
+				stateSlot := primitives.Slot(5)
+				slot := primitives.Slot(4)
+				targetRoot := bytes.Repeat([]byte{0xAA}, 32)
+				headRoot := bytes.Repeat([]byte{0xBB}, 32)
+				// Slot 4 was skipped so it inherits slot 3's root, and slot 3 is where the revealed payload is recorded.
+				return buildGloasStateForFlags(t, stateSlot, slot, targetRoot, headRoot, headRoot, 1, 3)
+			}(),
+			inputData: &ethpb.AttestationData{
+				Slot:            4,
+				CommitteeIndex:  1,
+				BeaconBlockRoot: bytes.Repeat([]byte{0xBB}, 32),
+				Source:          &ethpb.Checkpoint{Root: bytes.Repeat([]byte{0xDD}, 32)},
+				Target: &ethpb.Checkpoint{
+					Epoch: 0,
+					Root:  bytes.Repeat([]byte{0xAA}, 32),
+				},
+			},
+			inputDelay:      1,
+			inputParentSlot: 3,
 			participationIndices: map[uint8]bool{
 				sourceFlagIndex: true,
 				targetFlagIndex: true,
@@ -829,7 +862,7 @@ func TestAttestationParticipationFlagIndices(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		flagIndices, err := altair.AttestationParticipationFlagIndices(test.inputState, test.inputData, test.inputDelay)
+		flagIndices, err := altair.AttestationParticipationFlagIndices(test.inputState, test.inputData, test.inputDelay, test.inputParentSlot)
 		if test.participationIndices == nil {
 			require.ErrorContains(t, "committee index", err)
 			continue

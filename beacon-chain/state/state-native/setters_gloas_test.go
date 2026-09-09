@@ -281,6 +281,34 @@ func TestUpdatePendingPaymentWeight(t *testing.T) {
 			require.Equal(t, tt.wantWeight, payment.Weight)
 		})
 	}
+
+	t.Run("target equivocation credits once", func(t *testing.T) {
+		paymentIdx := int(slotsPerEpoch + (slot % slotsPerEpoch))
+		state := buildGloasStateForPaymentWeightTest(t, stateSlot, paymentIdx, 1, 0, map[primitives.Slot][]byte{
+			slot: rootA,
+		})
+
+		att := &ethpb.Attestation{
+			Data: &ethpb.AttestationData{
+				Slot:            slot,
+				CommitteeIndex:  0,
+				BeaconBlockRoot: rootA,
+				Source:          &ethpb.Checkpoint{},
+				Target: &ethpb.Checkpoint{
+					Epoch: stateEpoch,
+				},
+			},
+		}
+		indices := []uint64{0}
+
+		require.NoError(t, state.UpdatePendingPaymentWeight(att, indices, map[uint8]bool{cfg.TimelySourceFlagIndex: true}))
+		state.currentEpochParticipation[0] |= 1 << cfg.TimelySourceFlagIndex
+		require.NoError(t, state.UpdatePendingPaymentWeight(att, indices, map[uint8]bool{cfg.TimelyTargetFlagIndex: true}))
+
+		payment, err := state.BuilderPendingPayment(uint64(paymentIdx))
+		require.NoError(t, err)
+		require.Equal(t, primitives.Gwei(cfg.MinActivationBalance), payment.Weight)
+	})
 }
 
 func TestRotateBuilderPendingPayments(t *testing.T) {
@@ -390,7 +418,7 @@ func TestDecreaseWithdrawalBalances(t *testing.T) {
 		require.Equal(t, 0, len(st.dirtyIndices))
 	})
 
-	t.Run("updates validator and builder balances and tracks dirty indices", func(t *testing.T) {
+	t.Run("updates validator and builder balances; tracks Balances dirty indices only", func(t *testing.T) {
 		st := &BeaconState{
 			version:      version.Gloas,
 			dirtyFields:  make(map[types.FieldIndex]bool),
@@ -423,7 +451,7 @@ func TestDecreaseWithdrawalBalances(t *testing.T) {
 		require.Equal(t, true, st.dirtyFields[types.Balances])
 		require.Equal(t, true, st.dirtyFields[types.Builders])
 		require.DeepEqual(t, []uint64{1, 2}, st.dirtyIndices[types.Balances])
-		require.DeepEqual(t, []uint64{1, 0}, st.dirtyIndices[types.Builders])
+		require.Equal(t, 0, len(st.dirtyIndices[types.Builders]))
 	})
 
 	t.Run("returns error on builder index out of range", func(t *testing.T) {
@@ -882,7 +910,7 @@ func TestAddBuilderFromDeposit(t *testing.T) {
 		copy(pubkey[:], bytes.Repeat([]byte{0xAA}, 48))
 		var wc [32]byte
 		copy(wc[:], bytes.Repeat([]byte{0xBB}, 32))
-		wc[0] = 0x42 // version byte
+		wc[0] = 0x42 // registered version must ignore the credential prefix
 
 		st := &BeaconState{
 			version:     version.Gloas,
@@ -897,6 +925,7 @@ func TestAddBuilderFromDeposit(t *testing.T) {
 					Balance:           0,
 				},
 			},
+			builderIdxMap: map[[fieldparams.BLSPubkeyLength]byte]primitives.BuilderIndex{},
 		}
 
 		require.NoError(t, st.AddBuilderFromDeposit(pubkey, wc, 123))
@@ -904,7 +933,7 @@ func TestAddBuilderFromDeposit(t *testing.T) {
 		got := st.builders[0]
 		require.NotNil(t, got)
 		require.DeepEqual(t, pubkey[:], got.Pubkey)
-		require.DeepEqual(t, []byte{0x42}, got.Version)
+		require.DeepEqual(t, []byte{params.BeaconConfig().PayloadBuilderVersion}, got.Version)
 		require.DeepEqual(t, wc[12:], got.ExecutionAddress)
 		require.Equal(t, primitives.Gwei(123), got.Balance)
 		require.Equal(t, primitives.Epoch(0), got.DepositEpoch)
@@ -931,6 +960,7 @@ func TestAddBuilderFromDeposit(t *testing.T) {
 					Balance:           1,
 				},
 			},
+			builderIdxMap: map[[fieldparams.BLSPubkeyLength]byte]primitives.BuilderIndex{},
 		}
 
 		require.NoError(t, st.AddBuilderFromDeposit(pubkey, wc, 5))
@@ -1064,7 +1094,7 @@ func TestOnboardBuildersFromPendingDeposits(t *testing.T) {
 		require.Equal(t, 0, len(st.builders))
 	})
 
-	t.Run("drops invalid non-builder deposit", func(t *testing.T) {
+	t.Run("keeps invalid non-builder deposit in pending queue", func(t *testing.T) {
 		sk, err := bls.RandKey()
 		require.NoError(t, err)
 		validatorCreds := nonBuilderWithdrawalCredentials()
@@ -1072,8 +1102,40 @@ func TestOnboardBuildersFromPendingDeposits(t *testing.T) {
 
 		st := newGloasState(t, nil, nil, []*ethpb.PendingDeposit{deposit}, 0)
 		require.NoError(t, st.OnboardBuildersFromPendingDeposits())
-		require.Equal(t, 0, len(st.pendingDeposits))
+		require.Equal(t, 1, len(st.pendingDeposits))
 		require.Equal(t, 0, len(st.builders))
+	})
+
+	t.Run("creates builder then increases balance for same pubkey", func(t *testing.T) {
+		sk, err := bls.RandKey()
+		require.NoError(t, err)
+		builderCreds := builderWithdrawalCredentials(0x11)
+		depSlot := primitives.Slot(params.BeaconConfig().SlotsPerEpoch * 2)
+		depositCreate := newPendingDeposit(t, sk, builderCreds, 10, depSlot, true)
+		depositTopUp := newPendingDeposit(t, sk, builderCreds, 5, depSlot, true)
+
+		st := newGloasState(t, nil, nil, []*ethpb.PendingDeposit{depositCreate, depositTopUp}, 0)
+		require.NoError(t, st.OnboardBuildersFromPendingDeposits())
+		require.Equal(t, 0, len(st.pendingDeposits))
+		require.Equal(t, 1, len(st.builders))
+		require.Equal(t, primitives.Gwei(15), st.builders[0].Balance)
+	})
+
+	t.Run("invalid validator deposit followed by valid builder deposit same pubkey", func(t *testing.T) {
+		sk, err := bls.RandKey()
+		require.NoError(t, err)
+		validatorCreds := nonBuilderWithdrawalCredentials()
+		builderCreds := builderWithdrawalCredentials(0xFF)
+
+		depositInvalidValidator := newPendingDeposit(t, sk, validatorCreds, 5, 0, false)
+		depositBuilder := newPendingDeposit(t, sk, builderCreds, 7, 0, true)
+
+		st := newGloasState(t, nil, nil, []*ethpb.PendingDeposit{depositInvalidValidator, depositBuilder}, 0)
+		require.NoError(t, st.OnboardBuildersFromPendingDeposits())
+		require.Equal(t, 1, len(st.pendingDeposits))
+		require.DeepEqual(t, depositInvalidValidator, st.pendingDeposits[0])
+		require.Equal(t, 1, len(st.builders))
+		require.Equal(t, primitives.Gwei(7), st.builders[0].Balance)
 	})
 }
 

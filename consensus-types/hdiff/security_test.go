@@ -192,7 +192,8 @@ func TestSerializationRoundTrip(t *testing.T) {
 		hdiff, err := newHdiff(diff1)
 		require.NoError(t, err)
 
-		diff2 := hdiff.serialize()
+		diff2, err := hdiff.serialize()
+		require.NoError(t, err)
 
 		// Apply both diffs - should get same result
 		result1, err := ApplyDiff(t.Context(), source, diff1)
@@ -331,18 +332,15 @@ func TestConcurrencySafety(t *testing.T) {
 		var wg sync.WaitGroup
 		errors := make(chan error, numGoroutines*iterations)
 
-		for i := range numGoroutines {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-
+		for workerID := range numGoroutines {
+			wg.Go(func() {
 				for j := range iterations {
 					_, err := Diff(source, target)
 					if err != nil {
 						errors <- fmt.Errorf("worker %d iteration %d: %v", workerID, j, err)
 					}
 				}
-			}(i)
+			})
 		}
 
 		wg.Wait()
@@ -367,18 +365,15 @@ func TestConcurrencySafety(t *testing.T) {
 		var wg sync.WaitGroup
 		errors := make(chan error, numGoroutines)
 
-		for i := range numGoroutines {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-
+		for workerID := range numGoroutines {
+			wg.Go(func() {
 				// Each goroutine needs its own copy of the source state
 				localSource := source.Copy()
 				_, err := ApplyDiff(ctx, localSource, diff)
 				if err != nil {
 					errors <- fmt.Errorf("worker %d: %v", workerID, err)
 				}
-			}(i)
+			})
 		}
 
 		wg.Wait()

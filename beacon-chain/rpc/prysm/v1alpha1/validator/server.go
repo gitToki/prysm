@@ -6,7 +6,6 @@ package validator
 import (
 	"bytes"
 	"context"
-	"sync"
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/blockchain"
@@ -30,8 +29,8 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/startup"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state/stategen"
 	prysmSync "github.com/OffchainLabs/prysm/v7/beacon-chain/sync"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification"
 	"github.com/OffchainLabs/prysm/v7/config/params"
-	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	"github.com/OffchainLabs/prysm/v7/genesis"
@@ -49,12 +48,11 @@ import (
 type Server struct {
 	Ctx                              context.Context
 	PayloadIDCache                   *cache.PayloadIDCache
-	TrackedValidatorsCache           *cache.TrackedValidatorsCache
 	ProposerPreferencesCache         *cache.ProposerPreferencesCache
+	SubscribedValidatorsCache        *cache.SubscribedValidatorsCache
 	HighestBidCache                  *cache.HighestExecutionPayloadBidCache
-	executionPayloadEnvelopeMu       sync.RWMutex
-	executionPayloadEnvelope         *ethpb.ExecutionPayloadEnvelope
-	executionPayloadDataColumns      []blocks.RODataColumn
+	BuilderCircuitBreaker            *cache.BuilderCircuitBreaker
+	ExecutionPayloadEnvelopeCache    *cache.ExecutionPayloadEnvelopeCache
 	HeadFetcher                      blockchain.HeadFetcher
 	ForkFetcher                      blockchain.ForkFetcher
 	ForkchoiceFetcher                blockchain.ForkchoiceFetcher
@@ -81,7 +79,6 @@ type Server struct {
 	ExecutionPayloadEnvelopeReceiver blockchain.ExecutionPayloadEnvelopeReceiver
 	BlobReceiver                     blockchain.BlobReceiver
 	DataColumnReceiver               blockchain.DataColumnReceiver
-	MockEth1Votes                    bool
 	Eth1BlockFetcher                 execution.POWBlockFetcher
 	PendingDepositsFetcher           depositsnapshot.PendingDepositsFetcher
 	OperationNotifier                opfeed.Notifier
@@ -94,6 +91,7 @@ type Server struct {
 	ClockWaiter                      startup.ClockWaiter
 	CoreService                      *core.Service
 	AttestationStateFetcher          blockchain.AttestationStateFetcher
+	NewExecutionPayloadBidVerifier   verification.NewExecutionPayloadBidVerifier
 	GraffitiInfo                     *execution.GraffitiInfo
 }
 
@@ -118,7 +116,7 @@ func (vs *Server) WaitForActivation(req *ethpb.ValidatorActivationRequest, strea
 		return status.Errorf(codes.Internal, "Could not send response over stream: %v", err)
 	}
 
-	waitTime := time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second
+	waitTime := params.BeaconConfig().SlotDuration()
 	ticker := time.NewTicker(waitTime)
 	defer ticker.Stop()
 

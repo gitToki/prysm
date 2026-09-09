@@ -1,3 +1,5 @@
+//go:build minimal
+
 package validator
 
 import (
@@ -597,7 +599,7 @@ func TestPackAttestations_ElectraOnChainAggregates(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 6, len(atts))
 
-		totalBalance, err := helpers.TotalActiveBalance(st)
+		totalBalance, err := helpers.TotalActiveBalance(t.Context(), st)
 		require.NoError(t, err)
 
 		expected := []uint64{
@@ -626,7 +628,7 @@ func TestPackAttestations_ElectraOnChainAggregates(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 7, len(atts))
 
-		totalBalance, err := helpers.TotalActiveBalance(st)
+		totalBalance, err := helpers.TotalActiveBalance(t.Context(), st)
 		require.NoError(t, err)
 
 		got, err := electra.GetProposerRewardNumerator(ctx, st, atts[6], totalBalance)
@@ -654,7 +656,7 @@ func TestPackAttestations_ElectraOnChainAggregates(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 7, len(atts))
 
-		totalBalance, err := helpers.TotalActiveBalance(st)
+		totalBalance, err := helpers.TotalActiveBalance(t.Context(), st)
 		require.NoError(t, err)
 
 		// The reward numerator should be the same as the previous test.

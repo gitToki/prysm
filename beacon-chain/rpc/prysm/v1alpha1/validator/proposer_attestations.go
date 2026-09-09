@@ -54,8 +54,10 @@ func (vs *Server) packAttestations(ctx context.Context, latestState state.Beacon
 	versionAtts := make([]ethpb.Att, 0, len(atts))
 	if postElectra {
 		for _, a := range atts {
-			if a.Version() == version.Electra {
-				versionAtts = append(versionAtts, a)
+			if converted, ok := ethpb.AttestationElectraFromAtt(a); ok {
+				// Aggregate-and-proof gossip remains Electra-shaped. Normalize
+				// Gloas block attestations from the pool before deduplication.
+				versionAtts = append(versionAtts, converted)
 			}
 		}
 	} else {
@@ -207,7 +209,7 @@ func (a proposerAtts) sortOnChainAggregates(ctx context.Context, st state.ReadOn
 		return a, nil
 	}
 
-	totalBalance, err := helpers.TotalActiveBalance(st)
+	totalBalance, err := helpers.TotalActiveBalance(ctx, st)
 	if err != nil {
 		return nil, err
 	}

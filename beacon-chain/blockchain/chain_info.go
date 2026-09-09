@@ -32,6 +32,14 @@ type ChainInfoFetcher interface {
 	ForkFetcher
 	HeadDomainFetcher
 	ForkchoiceFetcher
+	PayloadAvailabilityFetcher
+}
+
+// PayloadAvailabilityFetcher provides the payload arrival and blob data availability status
+// used to build payload attestations.
+type PayloadAvailabilityFetcher interface {
+	PayloadEarly([32]byte) (bool, bool)
+	DataAvailable(context.Context, [32]byte, primitives.Slot) (bool, error)
 }
 
 // ForkchoiceFetcher defines a common interface for methods that access directly
@@ -41,18 +49,22 @@ type ChainInfoFetcher interface {
 type ForkchoiceFetcher interface {
 	Ancestor(context.Context, []byte, primitives.Slot) ([]byte, error)
 	BlockHash(root [32]byte) ([32]byte, error)
+	HasPayloadBlockHash(root, blockHash [32]byte) bool
+	GasLimit(root, blockHash [32]byte) (uint64, error)
 	CachedHeadRoot() [32]byte
 	GetProposerHead() [32]byte
 	SetForkChoiceGenesisTime(time.Time)
 	UpdateHead(context.Context, primitives.Slot)
 	HighestReceivedBlockSlot() primitives.Slot
 	HighestReceivedBlockRoot() [32]byte
+	HasNode([32]byte) bool
 	HasFullNode([32]byte) bool
 	FullBeatsEmpty([32]byte) bool
 	ReceivedBlocksLastEpoch() (uint64, error)
 	InsertNode(context.Context, state.BeaconState, consensus_blocks.ROBlock) error
 	InsertPayload(interfaces.ROExecutionPayloadEnvelope) error
 	ForkChoiceDump(context.Context) (*forkchoice.Dump, error)
+	ForkChoiceDumpV2(context.Context) (*forkchoice.DumpV2, error)
 	NewSlot(context.Context, primitives.Slot) error
 	ProposerBoost() [32]byte
 	RecentBlockSlot(root [32]byte) (primitives.Slot, error)
@@ -60,6 +72,7 @@ type ForkchoiceFetcher interface {
 	DependentRoot(primitives.Epoch) ([32]byte, error)
 	CanonicalNodeAtSlot(primitives.Slot) ([32]byte, bool)
 	ShouldIgnoreData(parentRoot [32]byte, dataSlot primitives.Slot) bool
+	RecordBlockForEquivocation(primitives.Slot, primitives.ValidatorIndex, [32]byte)
 }
 
 // TimeFetcher retrieves the Ethereum consensus data that's related to time.
@@ -78,6 +91,7 @@ type GenesisFetcher interface {
 type HeadFetcher interface {
 	HeadSlot() primitives.Slot
 	HeadRoot(ctx context.Context) ([]byte, error)
+	HeadRootAndFull() ([32]byte, bool)
 	HeadBlock(ctx context.Context) (interfaces.ReadOnlySignedBeaconBlock, error)
 	HeadState(ctx context.Context) (state.BeaconState, error)
 	HeadStateReadOnly(ctx context.Context) (state.ReadOnlyBeaconState, error)
@@ -87,6 +101,7 @@ type HeadFetcher interface {
 	HeadPublicKeyToValidatorIndex(pubKey [fieldparams.BLSPubkeyLength]byte) (primitives.ValidatorIndex, bool)
 	HeadValidatorIndexToPublicKey(ctx context.Context, index primitives.ValidatorIndex) ([fieldparams.BLSPubkeyLength]byte, error)
 	ChainHeads() ([][32]byte, []primitives.Slot)
+	IsBidCompatibleWithHead(interfaces.ROExecutionPayloadBid) bool
 	DependentRootForEpoch([32]byte, primitives.Epoch) ([32]byte, error)
 	TargetRootForEpoch([32]byte, primitives.Epoch) ([32]byte, error)
 	HeadSyncCommitteeFetcher
@@ -122,6 +137,7 @@ type FinalizationFetcher interface {
 	InForkchoice([32]byte) bool
 	IsFinalized(ctx context.Context, blockRoot [32]byte) bool
 	ParentPayloadReady(interfaces.ReadOnlyBeaconBlock) bool
+	BuiltOnFullParent(interfaces.ReadOnlyBeaconBlock) bool
 }
 
 // OptimisticModeFetcher retrieves information about optimistic status of the node.
@@ -189,6 +205,18 @@ func (s *Service) HeadRoot(ctx context.Context) ([]byte, error) {
 	}
 
 	return r[:], nil
+}
+
+// HeadRootAndFull returns the cached head root and whether its execution
+// payload has been delivered (post-Gloas).
+func (s *Service) HeadRootAndFull() ([32]byte, bool) {
+	s.headLock.RLock()
+	defer s.headLock.RUnlock()
+
+	if s.head == nil {
+		return params.BeaconConfig().ZeroHash, false
+	}
+	return s.head.root, s.head.full
 }
 
 // HeadBlock returns the head block of the chain.
@@ -411,10 +439,30 @@ func (s *Service) InForkchoice(root [32]byte) bool {
 	return s.cfg.ForkChoiceStore.HasNode(root)
 }
 
-// ParentPayloadReady returns true if the block's parent payload is available
-// in forkchoice. For pre-Gloas blocks or blocks building on empty, this always
-// returns true. For blocks building on full, it checks that the full node
-// exists.
+// builtOnFullParentInForkchoice assumes the parent node is already in forkchoice.
+func (s *Service) builtOnFullParentInForkchoice(blk interfaces.ReadOnlyBeaconBlock) bool {
+	if blk.Version() < version.Gloas {
+		return true
+	}
+	bid, err := blk.Body().SignedExecutionPayloadBid()
+	if err != nil || bid == nil || bid.Message == nil {
+		return false
+	}
+	blockHash, err := s.cfg.ForkChoiceStore.BlockHash(blk.ParentRoot())
+	if err != nil {
+		return false
+	}
+	return [32]byte(bid.Message.ParentBlockHash) == blockHash
+}
+
+// BuiltOnFullParent returns true if the block's bid builds on its parent's committed payload.
+func (s *Service) BuiltOnFullParent(blk interfaces.ReadOnlyBeaconBlock) bool {
+	s.cfg.ForkChoiceStore.RLock()
+	defer s.cfg.ForkChoiceStore.RUnlock()
+	return s.builtOnFullParentInForkchoice(blk)
+}
+
+// ParentPayloadReady returns true if the block's parent payload is available in forkchoice.
 func (s *Service) ParentPayloadReady(blk interfaces.ReadOnlyBeaconBlock) bool {
 	if blk.Version() < version.Gloas {
 		return true
@@ -422,17 +470,11 @@ func (s *Service) ParentPayloadReady(blk interfaces.ReadOnlyBeaconBlock) bool {
 	parentRoot := blk.ParentRoot()
 	s.cfg.ForkChoiceStore.RLock()
 	defer s.cfg.ForkChoiceStore.RUnlock()
-	blockHash, err := s.cfg.ForkChoiceStore.BlockHash(parentRoot)
-	if err != nil {
+	if !s.cfg.ForkChoiceStore.HasNode(parentRoot) {
 		return false
 	}
-	bid, err := blk.Body().SignedExecutionPayloadBid()
-	if err != nil || bid == nil || bid.Message == nil {
-		return false
-	}
-	parentBlockHash := [32]byte(bid.Message.ParentBlockHash)
-	if parentBlockHash != blockHash {
-		return true // builds on empty, no full node needed
+	if !s.builtOnFullParentInForkchoice(blk) {
+		return true
 	}
 	return s.cfg.ForkChoiceStore.HasFullNode(parentRoot)
 }
@@ -494,7 +536,7 @@ func (s *Service) IsOptimisticForRoot(ctx context.Context, root [32]byte) (bool,
 		return false, err
 	}
 	if lastValidated == nil {
-		lastValidated, err = s.recoverStateSummary(ctx, root)
+		lastValidated, err = s.recoverStateSummary(ctx, s.ensureRootNotZeros(bytesutil.ToBytes32(validatedCheckpoint.Root)))
 		if err != nil {
 			return false, err
 		}
@@ -506,11 +548,23 @@ func (s *Service) IsOptimisticForRoot(ctx context.Context, root [32]byte) (bool,
 	return !isCanonical, nil
 }
 
-// DependentRootForEpoch wraps the corresponding method in forkchoice
+// DependentRootForEpoch wraps the corresponding method in forkchoice. The
+// genesis-era underflow (slot < 2 epochs) is handled by falling back to the
+// origin block root so callers don't have to special-case it.
 func (s *Service) DependentRootForEpoch(root [32]byte, epoch primitives.Epoch) ([32]byte, error) {
+	if epoch == 0 {
+		return s.originBlockRoot, nil
+	}
 	s.cfg.ForkChoiceStore.RLock()
 	defer s.cfg.ForkChoiceStore.RUnlock()
-	return s.cfg.ForkChoiceStore.DependentRootForEpoch(root, epoch)
+	depRoot, err := s.cfg.ForkChoiceStore.DependentRootForEpoch(root, epoch)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	if depRoot == [32]byte{} {
+		return s.originBlockRoot, nil
+	}
+	return depRoot, nil
 }
 
 // TargetRootForEpoch wraps the corresponding method in forkchoice
@@ -594,10 +648,15 @@ func (s *Service) inRegularSync() bool {
 	return s.cfg.SyncChecker.Synced()
 }
 
-// validating returns true if the beacon is tracking some validators that have
-// registered for proposing.
+// canWaitForGossipSidecars reports whether the sidecars for slot may still arrive over gossip.
+func (s *Service) canWaitForGossipSidecars(slot primitives.Slot) bool {
+	return s.inRegularSync() && slot+1 >= s.CurrentSlot()
+}
+
+// validating returns true if at least one validator is attached to this BN
+// via beacon_committee_subscriptions.
 func (s *Service) validating() bool {
-	return s.cfg.TrackedValidatorsCache.Validating()
+	return s.cfg.SubscribedValidatorsCache.Validating()
 }
 
 // ShouldIgnoreData returns true if the data for the given parent root and slot should be ignored.

@@ -23,7 +23,6 @@ import (
 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
-	ethpbv1 "github.com/OffchainLabs/prysm/v7/proto/eth/v1"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/attestation"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
@@ -182,15 +181,8 @@ func (s *Service) updateCheckpoints(
 	preState, postState state.BeaconState,
 	blockRoot [32]byte,
 ) error {
-	if coreTime.CurrentEpoch(postState) > cp.c && s.cfg.ForkChoiceStore.IsCanonical(blockRoot) {
-		headSt, err := s.HeadState(ctx)
-		if err != nil {
-			return errors.Wrap(err, "could not get head state")
-		}
-		if err := reportEpochMetrics(ctx, postState, headSt); err != nil {
-			log.WithError(err).Error("Could not report epoch metrics")
-		}
-	}
+	s.reportEpochMetrics(postState, cp.c, blockRoot)
+
 	if err := s.updateJustificationOnBlock(ctx, preState, postState, cp.j); err != nil {
 		return errors.Wrap(err, "could not update justified checkpoint")
 	}
@@ -205,6 +197,24 @@ func (s *Service) updateCheckpoints(
 		s.executePostFinalizationTasks(ctx, postState)
 	}
 	return nil
+}
+
+func (s *Service) reportEpochMetrics(postState state.BeaconState, prevEpoch primitives.Epoch, blockRoot [32]byte) {
+	if coreTime.CurrentEpoch(postState) <= prevEpoch || !s.cfg.ForkChoiceStore.IsCanonical(blockRoot) {
+		return
+	}
+
+	go func() {
+		headSt, err := s.HeadState(s.ctx)
+		if err != nil {
+			log.WithError(err).Error("Could not get head state for epoch metrics")
+			return
+		}
+
+		if err := reportEpochMetrics(s.ctx, postState, headSt); err != nil {
+			log.WithError(err).Error("Could not report epoch metrics")
+		}
+	}()
 }
 
 func (s *Service) validateExecutionAndConsensus(
@@ -508,6 +518,7 @@ func (s *Service) markIncludedBlockBLSToExecChanges(headBlock interfaces.ReadOnl
 
 // This checks whether it's time to start saving hot state to DB.
 // It's time when there's `epochsSinceFinalitySaveHotStateDB` epochs of non-finality.
+//
 // Requires a read lock on forkchoice
 func (s *Service) checkSaveHotStateDB(ctx context.Context) error {
 	currentEpoch := slots.ToEpoch(s.CurrentSlot())
@@ -560,7 +571,13 @@ func (s *Service) validateStateTransition(ctx context.Context, preState state.Be
 		return nil, ErrNotDescendantOfFinalized
 	}
 	stateTransitionStartTime := time.Now()
-	postState, err := transition.ExecuteStateTransition(ctx, preState, signed)
+	var postState state.BeaconState
+	var err error
+	if s.skipBlockSignaturesForTesting {
+		_, postState, err = transition.ExecuteStateTransitionNoVerifyAnySig(ctx, preState, signed)
+	} else {
+		postState, err = transition.ExecuteStateTransition(ctx, preState, signed)
+	}
 	if err != nil {
 		if ctx.Err() != nil || electra.IsExecutionRequestError(err) {
 			return nil, err
@@ -569,6 +586,11 @@ func (s *Service) validateStateTransition(ctx context.Context, preState state.Be
 	}
 	stateTransitionProcessingTime.Observe(float64(time.Since(stateTransitionStartTime).Milliseconds()))
 	return postState, nil
+}
+
+// DisableBlockSignatureVerificationForTesting supports spectest vectors generated with bls_setting 2, their blocks are unsigned.
+func (s *Service) DisableBlockSignatureVerificationForTesting() {
+	s.skipBlockSignaturesForTesting = true
 }
 
 // updateJustificationOnBlock updates the justified checkpoint on DB if the
@@ -625,10 +647,10 @@ func (s *Service) sendNewFinalizedEvent(ctx context.Context, postState state.Bea
 	// Send an event regarding the new finalized checkpoint over a common event feed.
 	s.cfg.StateNotifier.StateFeed().Send(&feed.Event{
 		Type: statefeed.FinalizedCheckpoint,
-		Data: &ethpbv1.EventFinalizedCheckpoint{
+		Data: &statefeed.FinalizedCheckpointData{
 			Epoch:               postState.FinalizedCheckpoint().Epoch,
-			Block:               postState.FinalizedCheckpoint().Root,
-			State:               stateRoot[:],
+			Block:               bytesutil.ToBytes32(postState.FinalizedCheckpoint().Root),
+			State:               stateRoot,
 			ExecutionOptimistic: isValidPayload,
 		},
 	})

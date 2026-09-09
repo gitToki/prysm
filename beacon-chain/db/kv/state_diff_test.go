@@ -7,16 +7,19 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/gloas"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
 	"github.com/OffchainLabs/prysm/v7/cmd/beacon-chain/flags"
 	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/genesis"
 	"github.com/OffchainLabs/prysm/v7/math"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	"github.com/OffchainLabs/prysm/v7/testing/util"
+	"github.com/golang/snappy"
 	"go.etcd.io/bbolt"
 )
 
@@ -246,6 +249,8 @@ func TestStateDiff_SaveFullSnapshot(t *testing.T) {
 				if s == nil {
 					return bbolt.ErrIncompatibleValue
 				}
+				s, err = snappy.Decode(nil, s)
+				require.NoError(t, err)
 				require.DeepSSZEqual(t, enc, s)
 				return nil
 			})
@@ -509,6 +514,8 @@ func TestStateDiff_SaveDiff(t *testing.T) {
 				if s == nil {
 					return bbolt.ErrIncompatibleValue
 				}
+				s, err = snappy.Decode(nil, s)
+				require.NoError(t, err)
 				require.DeepSSZEqual(t, enc, s)
 				return nil
 			})
@@ -723,6 +730,65 @@ func TestStateDiff_SaveAndReadDiffForkTransition(t *testing.T) {
 	}
 }
 
+// TestStateDiff_SaveAndReadDiffForkTransitionGloas tests the Fulu→Gloas fork transition
+// explicitly since Gloas is not yet in version.All().
+func TestStateDiff_SaveAndReadDiffForkTransitionGloas(t *testing.T) {
+	setDefaultStateDiffExponents()
+
+	db := setupDB(t)
+
+	st, _ := util.DeterministicGenesisStateFulu(t, 64)
+
+	err := setOffsetInDB(db, 0)
+	require.NoError(t, err)
+
+	err = db.saveStateByDiff(context.Background(), st)
+	require.NoError(t, err)
+
+	slot := primitives.Slot(math.PowerOf2(5))
+	gloasSt, err := gloas.UpgradeToGloas(st.Copy())
+	require.NoError(t, err)
+	require.NoError(t, gloasSt.SetSlot(slot))
+
+	err = db.saveStateByDiff(context.Background(), gloasSt)
+	require.NoError(t, err)
+
+	readSt, err := db.stateByDiff(context.Background(), slot)
+	require.NoError(t, err)
+	require.NotNil(t, readSt)
+
+	stSSZ, err := gloasSt.MarshalSSZ()
+	require.NoError(t, err)
+	readStSSZ, err := readSt.MarshalSSZ()
+	require.NoError(t, err)
+	require.DeepSSZEqual(t, stSSZ, readStSSZ)
+}
+
+// TestStateDiff_SaveAndReadSnapshotGloas tests saving and reading a Gloas full snapshot.
+func TestStateDiff_SaveAndReadSnapshotGloas(t *testing.T) {
+	setDefaultStateDiffExponents()
+
+	db := setupDB(t)
+
+	err := setOffsetInDB(db, 0)
+	require.NoError(t, err)
+
+	st, _ := createState(t, 0, version.Gloas)
+
+	err = db.saveStateByDiff(context.Background(), st)
+	require.NoError(t, err)
+
+	readSt, err := db.stateByDiff(context.Background(), 0)
+	require.NoError(t, err)
+	require.NotNil(t, readSt)
+
+	stSSZ, err := st.MarshalSSZ()
+	require.NoError(t, err)
+	readStSSZ, err := readSt.MarshalSSZ()
+	require.NoError(t, err)
+	require.DeepSSZEqual(t, stSSZ, readStSSZ)
+}
+
 func TestStateDiff_OffsetCache(t *testing.T) {
 	setDefaultStateDiffExponents()
 
@@ -754,6 +820,50 @@ func TestStateDiff_OffsetCache(t *testing.T) {
 	}
 }
 
+type blockingMarshalBeaconState struct {
+	state.ReadOnlyBeaconState
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingMarshalBeaconState) MarshalSSZ() ([]byte, error) {
+	close(s.started)
+	<-s.release
+	return s.ReadOnlyBeaconState.MarshalSSZ()
+}
+
+func TestStateDiffCache_AnchorAccess(t *testing.T) {
+	setDefaultStateDiffExponents()
+
+	t.Run("out of range read", func(t *testing.T) {
+		cache := &stateDiffCache{anchors: make([][]byte, 1)}
+		require.IsNil(t, cache.getAnchor(-1))
+		require.IsNil(t, cache.getAnchor(1))
+	})
+
+	t.Run("reanchor during encoding", func(t *testing.T) {
+		cache := &stateDiffCache{anchors: make([][]byte, len(flags.Get().StateDiffExponents)-1)}
+		anchor, _ := createState(t, 0, version.Phase0)
+		blockingAnchor := &blockingMarshalBeaconState{
+			ReadOnlyBeaconState: anchor,
+			started:             make(chan struct{}),
+			release:             make(chan struct{}),
+		}
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- cache.setAnchor(0, blockingAnchor)
+		}()
+
+		<-blockingAnchor.started
+		cache.reanchor(32, make([]bool, len(flags.Get().StateDiffExponents)))
+		close(blockingAnchor.release)
+
+		require.NoError(t, <-errCh)
+		require.IsNil(t, cache.getAnchor(0))
+		require.Equal(t, uint64(32), cache.getOffset())
+	})
+}
+
 func TestStateDiff_AnchorCache(t *testing.T) {
 	setDefaultStateDiffExponents()
 
@@ -777,9 +887,14 @@ func TestStateDiff_AnchorCache(t *testing.T) {
 			err = db.saveStateByDiff(context.Background(), st)
 			require.NoError(t, err)
 			localCache[0] = st
+			require.Equal(t, len(db.stateDiffCache.anchors[0]), cap(db.stateDiffCache.anchors[0]))
 
 			// level 0 should be the same
-			require.DeepEqual(t, localCache[0], db.stateDiffCache.getAnchor(0))
+			localSSZ, err := localCache[0].MarshalSSZ()
+			require.NoError(t, err)
+			cachedSSZ, err := db.stateDiffCache.getAnchor(0).MarshalSSZ()
+			require.NoError(t, err)
+			require.DeepSSZEqual(t, localSSZ, cachedSSZ)
 
 			// rest of the cache should be nil
 			for i := 1; i < len(exponents)-1; i++ {
@@ -818,12 +933,93 @@ func TestStateDiff_AnchorCache(t *testing.T) {
 			localCache[0] = st
 
 			// level 0 should be the same
-			require.DeepEqual(t, localCache[0], db.stateDiffCache.getAnchor(0))
+			localSSZ, err = localCache[0].MarshalSSZ()
+			require.NoError(t, err)
+			cachedSSZ, err = db.stateDiffCache.getAnchor(0).MarshalSSZ()
+			require.NoError(t, err)
+			require.DeepSSZEqual(t, localSSZ, cachedSSZ)
 
 			// rest of the cache should be nil
 			for i := 1; i < len(exponents)-1; i++ {
 				require.IsNil(t, db.stateDiffCache.getAnchor(i))
 			}
+		})
+	}
+}
+
+func TestStateDiff_EnsureEmbeddedGenesisKeepsCheckpointSyncedTree(t *testing.T) {
+	testCases := []struct {
+		name             string
+		hasOriginBlkRoot bool
+	}{
+		{
+			name:             "origin checkpoint block root available",
+			hasOriginBlkRoot: true,
+		},
+		{
+			// Pruning ran long enough to delete the origin block, and with it the origin checkpoint
+			// block root. Only the anchor is left to tell that this database was not synced from genesis.
+			name:             "origin checkpoint block root pruned",
+			hasOriginBlkRoot: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCfg := features.InitWithReset(&features.Flags{EnableStateDiff: true})
+			defer resetCfg()
+
+			setDefaultStateDiffExponents()
+
+			// The genesis state is globally available from the embedded or provider genesis, even for a node
+			// that was synced from a checkpoint and has no genesis data in its database.
+			genesisState, err := util.NewBeaconStateFulu()
+			require.NoError(t, err)
+			genesis.StoreStateDuringTest(t, genesisState)
+
+			db := setupDB(t)
+
+			// A checkpoint-synced node anchors the tree at the origin state's slot, but never stores a
+			// genesis block.
+			const offset = primitives.Slot(14689088)
+			originState, _ := createState(t, offset, version.Fulu)
+			require.NoError(t, db.initializeStateDiff(offset, originState))
+
+			if tc.hasOriginBlkRoot {
+				require.NoError(t, db.SaveOriginCheckpointBlockRoot(t.Context(), [32]byte{1}))
+			} else {
+				_, err := db.OriginCheckpointBlockRoot(t.Context())
+				require.ErrorIs(t, err, ErrNotFoundOriginBlockRoot)
+			}
+
+			// A few epochs worth of diffs accumulate on top of the anchor.
+			for slot := offset + 32; slot <= offset+128; slot += 32 {
+				st, _ := createState(t, slot, version.Fulu)
+				require.NoError(t, db.saveStateByDiff(t.Context(), st))
+			}
+
+			// This runs on every restart, and must leave a checkpoint-synced database alone.
+			require.NoError(t, db.EnsureEmbeddedGenesis(t.Context()))
+
+			gb, err := db.GenesisBlock(t.Context())
+			require.NoError(t, err)
+			require.IsNil(t, gb)
+
+			// The tree must still be anchored where the origin put it, and still be readable.
+			require.Equal(t, uint64(offset), db.getOffset())
+
+			st, err := db.stateByDiff(t.Context(), offset+128)
+			require.NoError(t, err)
+			require.Equal(t, offset+128, st.Slot())
+
+			// And the database must still open on the next restart.
+			storedOffset, err := db.loadOffset()
+			require.NoError(t, err)
+			require.Equal(t, uint64(offset), storedOffset)
+
+			cache, err := populateStateDiffCacheFromDB(db, storedOffset)
+			require.NoError(t, err)
+			require.NoError(t, validateStateDiffCache(t.Context(), db, cache))
 		})
 	}
 }
@@ -909,6 +1105,15 @@ func createState(t *testing.T, slot primitives.Slot, v int) (state.ReadOnlyBeaco
 			PreviousVersion: p.ElectraForkVersion,
 			CurrentVersion:  p.FuluForkVersion,
 			Epoch:           p.FuluForkEpoch,
+		})
+		require.NoError(t, err)
+	case version.Gloas:
+		st, err = util.NewBeaconStateGloas()
+		require.NoError(t, err)
+		err = st.SetFork(&ethpb.Fork{
+			PreviousVersion: p.FuluForkVersion,
+			CurrentVersion:  p.GloasForkVersion,
+			Epoch:           p.GloasForkEpoch,
 		})
 		require.NoError(t, err)
 	default:

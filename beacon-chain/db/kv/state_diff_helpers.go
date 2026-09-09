@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
 	statenative "github.com/OffchainLabs/prysm/v7/beacon-chain/state/state-native"
@@ -18,6 +19,16 @@ import (
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	pkgerrors "github.com/pkg/errors"
 	"go.etcd.io/bbolt"
+)
+
+const (
+	// stateDiffTreeKeyLength is the length of a state-diff tree key, before any suffix.
+	stateDiffTreeKeyLength = 16
+
+	// stateDiffTreeKeySlotEnd is the end of the meaningful part of a state-diff tree key: a level
+	// byte followed by a little-endian slot. The bytes up to stateDiffTreeKeyLength are padding,
+	// and are always zero.
+	stateDiffTreeKeySlotEnd = 9
 )
 
 var (
@@ -111,10 +122,36 @@ func (s *Store) loadStateDiffExponents() ([]int, error) {
 }
 
 func makeKeyForStateDiffTree(level int, slot uint64) []byte {
-	buf := make([]byte, 16)
+	buf := make([]byte, stateDiffTreeKeyLength)
 	buf[0] = byte(level)
-	binary.LittleEndian.PutUint64(buf[1:], slot)
+	binary.LittleEndian.PutUint64(buf[1:stateDiffTreeKeySlotEnd], slot)
 	return buf
+}
+
+// isStateDiffTreeKey reports whether the given key holds a tree entry, as opposed to one of the
+// metadata keys stored in the same bucket.
+func isStateDiffTreeKey(key []byte) bool {
+	if len(key) < stateDiffTreeKeyLength {
+		return false
+	}
+
+	if int(key[0]) >= len(flags.Get().StateDiffExponents) {
+		return false
+	}
+
+	for _, padding := range key[stateDiffTreeKeySlotEnd:stateDiffTreeKeyLength] {
+		if padding != 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// stateDiffTreeKeySlot returns the slot a state-diff tree key is stored at.
+// It must only be called on a key that isStateDiffTreeKey accepts.
+func stateDiffTreeKeySlot(key []byte) uint64 {
+	return binary.LittleEndian.Uint64(key[1:stateDiffTreeKeySlotEnd])
 }
 
 func (s *Store) getAnchorState(ctx context.Context, offset uint64, lvl int, slot primitives.Slot) (anchor state.ReadOnlyBeaconState, err error) {
@@ -126,10 +163,8 @@ func (s *Store) getAnchorState(ctx context.Context, offset uint64, lvl int, slot
 		return nil, ErrSlotBeforeOffset
 	}
 	relSlot := uint64(slot) - offset
+	// The exponents are validated at node startup, so they always fit in a uint64 shift.
 	prevExp := flags.Get().StateDiffExponents[lvl-1]
-	if prevExp < flags.MinStateDiffExponent || prevExp >= 64 {
-		return nil, fmt.Errorf("state diff exponent %d out of range for uint64", prevExp)
-	}
 	span := math.PowerOf2(uint64(prevExp))
 	anchorSlot := primitives.Slot(uint64(slot) - relSlot%span)
 
@@ -140,10 +175,15 @@ func (s *Store) getAnchorState(ctx context.Context, offset uint64, lvl int, slot
 	}
 
 	// Check if we have the anchor in cache.
+	startTime := time.Now()
 	anchor = s.stateDiffCache.getAnchor(anchorLvl)
 	if anchor != nil && anchor.Slot() == anchorSlot {
+		stateDiffGetAnchorStateCacheHitReadTime.Observe(float64(time.Since(startTime)) / float64(time.Millisecond))
+		stateDiffGetAnchorStateCacheHit.Inc()
 		return anchor, nil
 	}
+	stateDiffGetAnchorStateCacheMissTime.Observe(float64(time.Since(startTime)) / float64(time.Millisecond))
+	stateDiffGetAnchorStateCacheMiss.Inc()
 	if anchor != nil {
 		log.WithField("level", anchorLvl).
 			WithField("expectedSlot", anchorSlot).
@@ -152,10 +192,12 @@ func (s *Store) getAnchorState(ctx context.Context, offset uint64, lvl int, slot
 	}
 
 	// If not, load it from the database.
+	startTime = time.Now()
 	anchor, err = s.stateByDiff(ctx, anchorSlot)
 	if err != nil {
 		return nil, err
 	}
+	stateDiffGetAnchorStateDBReadTime.Observe(float64(time.Since(startTime)) / float64(time.Millisecond))
 
 	// Save it in the cache.
 	err = s.stateDiffCache.setAnchor(anchorLvl, anchor)
@@ -171,10 +213,8 @@ func computeLevel(offset uint64, slot primitives.Slot) int {
 		return -1
 	}
 	rel := uint64(slot) - offset
+	// The exponents are validated at node startup, so they always fit in a uint64 shift.
 	for i, exp := range flags.Get().StateDiffExponents {
-		if exp < flags.MinStateDiffExponent || exp >= 64 {
-			return -1
-		}
 		span := math.PowerOf2(uint64(exp))
 		if rel%span == 0 {
 			return i
@@ -254,6 +294,26 @@ func (s *Store) hasStateDiffOffset() (bool, error) {
 	return hasOffset, err
 }
 
+// stateDiffAnchoredAfterGenesis returns true if the state-diff tree is anchored on a slot after
+// genesis (which only happens on a database synced from a checkpoint).
+func (s *Store) stateDiffAnchoredAfterGenesis() (bool, error) {
+	hasOffset, err := s.hasStateDiffOffset()
+	if err != nil {
+		return false, fmt.Errorf("has state diff offset: %w", err)
+	}
+
+	if !hasOffset {
+		return false, nil
+	}
+
+	offset, err := s.loadOffset()
+	if err != nil {
+		return false, fmt.Errorf("load offset: %w", err)
+	}
+
+	return offset != 0, nil
+}
+
 // initializeStateDiff sets up the state-diff schema for a new database.
 // This should be called during checkpoint sync or genesis sync.
 func (s *Store) initializeStateDiff(slot primitives.Slot, initialState state.ReadOnlyBeaconState) error {
@@ -261,10 +321,15 @@ func (s *Store) initializeStateDiff(slot primitives.Slot, initialState state.Rea
 	if !features.Get().EnableStateDiff {
 		return nil
 	}
+
+	if slot%32 != 0 {
+		return errors.New("cannot initialize state diff with a non epoch boundary offset")
+	}
+
 	// Only reinitialize if the offset is different
 	if s.stateDiffCache != nil {
 		if s.stateDiffCache.getOffset() == uint64(slot) {
-			log.WithField("offset", slot).Warning("Ignoring state diff cache reinitialization")
+			log.WithField("offset", slot).Debug("Ignoring state diff cache reinitialization")
 			return nil
 		}
 	}
@@ -303,7 +368,7 @@ func (s *Store) initializeStateDiff(slot primitives.Slot, initialState state.Rea
 		return pkgerrors.Wrap(err, "failed to save initial snapshot")
 	}
 
-	log.WithField("offset", slot).Info("Initialized state-diff cache")
+	log.WithField("offset", slot).Debug("Initialized state-diff cache")
 	return nil
 }
 

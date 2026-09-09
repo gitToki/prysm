@@ -15,7 +15,10 @@ import (
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	validatorpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/validator-client"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // SubmitPayloadAttestation submits a payload attestation message for a PTC member.
@@ -28,10 +31,33 @@ func (v *validator) SubmitPayloadAttestation(ctx context.Context, slot primitive
 		return
 	}
 
-	v.waitUntilSlotComponent(ctx, slot, params.BeaconConfig().PayloadAttestationDueBPS)
+	v.waitForPayloadAvailableOrDeadline(ctx, slot)
+
+	ctx, err := v.withPayloadHeadHint(ctx, slot)
+	if err != nil {
+		validatorPayloadAttestationSubmissionTotal.WithLabelValues("failed").Inc()
+		log.WithField("slot", slot).WithError(err).Error("Could not attach freshness hint")
+		tracing.AnnotateError(span, err)
+		return
+	}
 
 	data, err := v.validatorClient.PayloadAttestationData(ctx, slot)
 	if err != nil {
+		if status.Code(errors.Cause(err)) == codes.Unavailable {
+			validatorPayloadAttestationSubmissionTotal.WithLabelValues("skipped_unavailable").Inc()
+			log.WithFields(logrus.Fields{
+				"slot":   slot,
+				"reason": status.Convert(errors.Cause(err)).Message(),
+			}).Info("Skipping payload attestation: data unavailable")
+			tracing.AnnotateError(span, err)
+			return
+		}
+		if status.Code(errors.Cause(err)) == codes.NotFound {
+			validatorPayloadAttestationSubmissionTotal.WithLabelValues("skipped_no_block").Inc()
+			log.WithField("slot", slot).Info("Skipping payload attestation: no block for slot")
+			tracing.AnnotateError(span, err)
+			return
+		}
 		validatorPayloadAttestationSubmissionTotal.WithLabelValues("failed").Inc()
 		log.WithError(err).Error("Could not request payload attestation data")
 		tracing.AnnotateError(span, err)
@@ -98,5 +124,6 @@ func (v *validator) SubmitPayloadAttestation(ctx context.Context, slot primitive
 		"payloadPresent":     data.PayloadPresent,
 		"blobDataAvailable":  data.BlobDataAvailable,
 		"validatorIndex":     duty.ValidatorIndex,
-	}).Info("Submitted new payload attestation")
+	}).Debug("Submitted new payload attestation")
+	v.saveSubmittedPayloadAtt(data, duty.ValidatorIndex)
 }

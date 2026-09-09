@@ -60,7 +60,6 @@ var appHelpFlagGroups = []flagGroup{
 			flags.WalletPasswordFileFlag,
 			cmd.ClearDB,
 			cmd.ForceClearDB,
-			cmd.EnableBackupWebhookFlag,
 			cmd.EnableTracingFlag,
 			cmd.TracingProcessNameFlag,
 			cmd.TracingEndpointFlag,
@@ -118,6 +117,7 @@ var appHelpFlagGroups = []flagGroup{
 			flags.EnableBuilderFlag,
 			flags.BuilderGasLimitFlag,
 			flags.ValidatorsRegistrationBatchSizeFlag,
+			flags.EnableStatelessFlag,
 			flags.GraffitiFlag,
 			flags.GraffitiFileFlag,
 		},
@@ -128,13 +128,7 @@ var appHelpFlagGroups = []flagGroup{
 			flags.Web3SignerURLFlag,
 			flags.Web3SignerPublicValidatorKeysFlag,
 			flags.Web3SignerKeyFileFlag,
-		},
-	},
-	{
-		Name: "slasher",
-		Flags: []cli.Flag{
-			flags.SlasherRPCProviderFlag,
-			flags.SlasherCertFlag,
+			flags.Web3SignerKeyPollIntervalFlag,
 		},
 	},
 	{
@@ -151,13 +145,6 @@ var appHelpFlagGroups = []flagGroup{
 	{
 		Name:  "features",
 		Flags: features.ActiveFlags(features.ValidatorFlags),
-	},
-	{
-		Name: "interop",
-		Flags: []cli.Flag{
-			flags.InteropNumValidators,
-			flags.InteropStartIndex,
-		},
 	},
 	{
 		Name:  "deprecated",

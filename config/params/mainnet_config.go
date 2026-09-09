@@ -96,7 +96,8 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	BLSWithdrawalPrefixByte:         byte(0),
 	ETH1AddressWithdrawalPrefixByte: byte(1),
 	CompoundingWithdrawalPrefixByte: byte(2),
-	BuilderWithdrawalPrefixByte:     byte(3),
+	BuilderWithdrawalPrefixByte:     byte(0xB0),
+	PayloadBuilderVersion:           byte(0),
 	BuilderIndexSelfBuild:           primitives.BuilderIndex(math.MaxUint64),
 	ZeroHash:                        [32]byte{},
 
@@ -134,6 +135,8 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	SyncMessageDueBPSGloas:   primitives.BP(2500),
 	ContributionDueBPSGloas:  primitives.BP(5000),
 	PayloadAttestationDueBPS: primitives.BP(7500),
+	PayloadDueBPS:            primitives.BP(5000),
+	EquivocationEarlyDueBPS:  primitives.BP(7500),
 
 	// Ethereum PoW parameters.
 	DepositChainID:         1, // Chain ID of eth1 mainnet.
@@ -196,6 +199,8 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	DomainBeaconBuilder:               bytesutil.Uint32ToBytes4(0x0B000000),
 	DomainPTCAttester:                 bytesutil.Uint32ToBytes4(0x0C000000),
 	DomainProposerPreferences:         bytesutil.Uint32ToBytes4(0x0D000000),
+	DomainBuilderRequestAuth:          bytesutil.Uint32ToBytes4(0x0B000001),
+	DomainBuilderDeposit:              bytesutil.Uint32ToBytes4(0x0E000000),
 
 	// Prysm constants.
 	GenesisValidatorsRoot:          [32]byte{75, 54, 61, 185, 78, 40, 97, 32, 215, 110, 185, 5, 52, 15, 221, 78, 84, 191, 233, 240, 107, 243, 63, 246, 207, 90, 210, 127, 81, 27, 254, 149},
@@ -298,6 +303,18 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	// Mevboost circuit breaker
 	MaxBuilderConsecutiveMissedSlots: 3,
 	MaxBuilderEpochMissedSlots:       5,
+	// Builder `getHeader` timeout.
+	BuilderHeaderTimeout: BuilderProposalDelayTolerance,
+
+	// Gloas builder circuit breaker
+	BuilderAllowedFailures:         0,
+	BuilderCriticalFailures:        2,
+	BuilderBlacklistPeriod:         1,
+	BuilderCriticalBlacklistPeriod: 256,
+	BuilderFailureBackOffPeriod:    5,
+	BuilderCriticalFailedBuilders:  7,
+	BuilderFailureWeightThreshold:  60,
+
 	// Execution engine timeout value
 	ExecutionEngineTimeoutValue: 8, // 8 seconds default based on: https://github.com/ethereum/execution-apis/blob/main/src/engine/specification.md#core
 
@@ -346,9 +363,14 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	BalancePerAdditionalCustodyGroup:      32_000_000_000,
 
 	// Values related to gloas
-	BuilderPaymentThresholdNumerator:   6,
-	BuilderPaymentThresholdDenominator: 10,
-	MaxRequestPayloads:                 128,
+	BuilderPaymentThresholdNumerator:     6,
+	BuilderPaymentThresholdDenominator:   10,
+	MaxRequestPayloads:                   128,
+	ChurnLimitQuotientGloas:              32_768,
+	ConsolidationChurnLimitQuotient:      65_536,
+	MaxPerEpochActivationChurnLimitGloas: 256_000_000_000,
+	MaxBuilderDepositRequestsPerPayload:  64, // 2**6 (= 64)
+	MaxBuilderExitRequestsPerPayload:     16, // 2**4 (= 16)
 
 	// Values related to networking parameters.
 	MaxPayloadSize:                  10 * 1 << 20, // 10 MiB
@@ -366,6 +388,9 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	AttestationSubnetPrefixBits:     6,
 	SubnetsPerNode:                  2,
 	NodeIdBits:                      256,
+
+	// Values related to the fast confirmation rule.
+	ConfirmationByzantineThreshold: 25,
 
 	BlobSchedule: []BlobScheduleEntry{
 		{

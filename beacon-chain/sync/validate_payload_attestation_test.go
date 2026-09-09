@@ -39,8 +39,7 @@ func TestValidatePayloadAttestationMessage_IncorrectTopic(t *testing.T) {
 	require.NoError(t, err)
 
 	topic := p2p.GossipTypeMapping[reflect.TypeFor[*ethpb.PayloadAttestation]()]
-	digest, err := s.currentForkDigest()
-	require.NoError(t, err)
+	digest := s.currentForkDigest()
 	topic = s.addDigestToTopic(topic, digest)
 
 	result, err := s.validatePayloadAttestation(ctx, "", &pubsub.Message{
@@ -66,9 +65,9 @@ func TestValidatePayloadAttestationMessage_ErrorPathsWithMock(t *testing.T) {
 			result: pubsub.ValidationIgnore,
 		},
 		{
-			error: errors.New("block root seen"),
+			error: errors.New("block slot mismatch"),
 			verifier: func(pa payloadattestation.ROMessage, reqs []verification.Requirement) verification.PayloadAttestationMsgVerifier {
-				return &verification.MockPayloadAttestation{ErrPayloadAttBlockRootNotSeen: errors.New("block root seen")}
+				return &verification.MockPayloadAttestation{ErrPayloadAttBlockSlotMismatch: errors.New("block slot mismatch")}
 			},
 			result: pubsub.ValidationIgnore,
 		},
@@ -98,7 +97,9 @@ func TestValidatePayloadAttestationMessage_ErrorPathsWithMock(t *testing.T) {
 		t.Run(tt.error.Error(), func(t *testing.T) {
 			ctx := context.Background()
 			p := p2ptest.NewTestP2P(t)
-			chainService := &mock.ChainService{Genesis: time.Unix(time.Now().Unix()-int64(params.BeaconConfig().SecondsPerSlot), 0)}
+			st, err := util.NewBeaconState()
+			require.NoError(t, err)
+			chainService := &mock.ChainService{Genesis: time.Unix(time.Now().Unix()-int64(params.BeaconConfig().SecondsPerSlot), 0), State: st}
 			s := &Service{
 				payloadAttestationCache: &cache.PayloadAttestationCache{},
 				cfg:                     &config{chain: chainService, p2p: p, initialSync: &mockSync.Sync{}, clock: startup.NewClock(chainService.Genesis, chainService.ValidatorsRoot)}}
@@ -106,12 +107,11 @@ func TestValidatePayloadAttestationMessage_ErrorPathsWithMock(t *testing.T) {
 
 			msg := newPayloadAttestationMessage()
 			buf := new(bytes.Buffer)
-			_, err := p.Encoding().EncodeGossip(buf, msg)
+			_, err = p.Encoding().EncodeGossip(buf, msg)
 			require.NoError(t, err)
 
 			topic := p2p.GossipTypeMapping[reflect.TypeFor[*ethpb.PayloadAttestationMessage]()]
-			digest, err := s.currentForkDigest()
-			require.NoError(t, err)
+			digest := s.currentForkDigest()
 			topic = s.addDigestToTopic(topic, digest)
 
 			result, err := s.validatePayloadAttestation(ctx, "", &pubsub.Message{
@@ -129,7 +129,9 @@ func TestValidatePayloadAttestationMessage_ErrorPathsWithMock(t *testing.T) {
 func TestValidatePayloadAttestationMessage_Accept(t *testing.T) {
 	ctx := context.Background()
 	p := p2ptest.NewTestP2P(t)
-	chainService := &mock.ChainService{Genesis: time.Unix(time.Now().Unix()-int64(params.BeaconConfig().SecondsPerSlot), 0)}
+	st, err := util.NewBeaconState()
+	require.NoError(t, err)
+	chainService := &mock.ChainService{Genesis: time.Unix(time.Now().Unix()-int64(params.BeaconConfig().SecondsPerSlot), 0), State: st}
 	s := &Service{
 		payloadAttestationCache: &cache.PayloadAttestationCache{},
 		cfg:                     &config{chain: chainService, p2p: p, initialSync: &mockSync.Sync{}, clock: startup.NewClock(chainService.Genesis, chainService.ValidatorsRoot)}}
@@ -139,12 +141,11 @@ func TestValidatePayloadAttestationMessage_Accept(t *testing.T) {
 
 	msg := newPayloadAttestationMessage()
 	buf := new(bytes.Buffer)
-	_, err := p.Encoding().EncodeGossip(buf, msg)
+	_, err = p.Encoding().EncodeGossip(buf, msg)
 	require.NoError(t, err)
 
 	topic := p2p.GossipTypeMapping[reflect.TypeFor[*ethpb.PayloadAttestationMessage]()]
-	digest, err := s.currentForkDigest()
-	require.NoError(t, err)
+	digest := s.currentForkDigest()
 	topic = s.addDigestToTopic(topic, digest)
 
 	result, err := s.validatePayloadAttestation(ctx, "", &pubsub.Message{
